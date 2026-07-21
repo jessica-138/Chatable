@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Disappearing Chat app</title>
+        <link rel="stylesheet" href="style.css">
+
+</head>
+<body>
+    <h1>Chatable</h1>
+    <div id="app-container">
+        <!-- welcome -->
+        <div id="view-welcome" class="welcome-page"> 
+            <button id="create-choose">CREATE ROOM</button>
+            <button id="join-choose">JOIN ROOM</button>
+        </div>
+
+        <!-- create -->
+        <div id="view-create" class="form-box hidden">
+            <h3>Create New Room</h3>
+            <input type="text" placeholder="Enter username" id="create-username">
+            <input type="number" placeholder="Enter room lifetime (in mins)" id="room-dur" value="30" min="1">
+            <div class="button-row">
+                <button id="create-btn">Create Room (and generate code)</button>
+                <button class="back-btn">Cancel</button>
+            </div>
+            
+        </div>
+
+        <!-- join -->
+        <div id="view-join" class="form-box hidden">
+            <h3>Join An Existing Room</h3>
+            <input type="text" placeholder="Enter username" id="join-username">
+            <input type="text" placeholder="Enter 5-letter code" id="join-code">
+            <div class="button-row">
+                <button id="join-btn">Join Room</button>
+                <button class="back-btn">Cancel</button>
+            </div>
+        </div>
+
+        <!-- chat -->
+        <div id="view-chat" class="form-box hidden">
+            <div class="chat-header">
+                <h2>Room: <span id="display-roomcode">XXXX</span></h2>
+                <button id="leave-btn">Leave</button>
+            </div>
+
+            <div class="chat-container">
+                <div class="chat-sidebar">
+                    <h4>Active users</h4>
+                    <ul id="user-list"></ul>
+                </div>
+
+                <div class="chat-main">
+                    <div id="messages"></div>
+                    <div class="chat-input">
+                        <input id="msg-input" type="text" placeholder="Enter message">
+                        <button id="msg-send-btn">SEND</button>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+    
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="script.js"></script> 
+</body>
+</html> 
