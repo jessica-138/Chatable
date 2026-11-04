@@ -149,6 +149,7 @@ createbtn.addEventListener("click", ()=>{
             console.log("current room info: ", response)
 
             displayroomcode.textContent = response.roomCode
+            messages_container.innerHTML = "";
             userlist.innerHTML = ""
             const hostElement = document.createElement("li")
             hostElement.textContent =  `${username} (Host)`

@@ -1,196 +1,103 @@
-// import these functions
 const { generateRoomCode, createRoomObject } = require('./functions');
+const store = require('./redisStore');
+const { MAX_ROOM_DURATION } = require('./config');
 
-// exporting this function to server.js
-module.exports = function(io, socket, rooms, socket_room) {
-    
-    // --------------------------------------- CREATE -----------------------------------------------------------
-    socket.on("create-room", ({ username, durationMins }, callback) => {
-        // if this client is alrdy in a room
-        if (socket_room[socket.id]) {
-            return callback({ success: false, error: "You are already inside a room!" });
-        }
-        
-        // username validation - if invalid, send to the frontend's callback
-        if (!username || username.trim() === ""){
-            return callback({ success: false, error: "Username is required" });
-        }
+const remainingMs = (room) => room.expiresAt - Date.now();
 
-        // Duration validation - convert duration mins (might be string) into integer(base 10) 
-        let minutes = parseInt(durationMins, 10);
-        if (isNaN(minutes) || minutes <= 0){              // if Not-A-Number or <=0, default=60 mins
-            minutes = 60; 
-        }
-        
-        // Room code - generate
-        const roomCode = generateRoomCode(rooms);
-
-        // hostUser obj - create
-        const hostUser ={
-            // generate userId
-            userId: Math.random().toString(36).substring(2, 11), // converts random no to base-36
-            socketId: socket.id,
-            username: username.trim(),
-            joinedAt: Date.now()
-        };
-
-        // update rooms object
-        rooms[roomCode] = createRoomObject(roomCode, hostUser, minutes);
-
-        // update socket_room object
-        // needed for easy deletion of socket if the user disconnects
-        socket_room[socket.id] = roomCode
-
-        // JOIN Socket.IO ROOM CHANNEL
-        // Places the user's socket connection into a virtual scoket.io room
-        // allows server to easily broadcast messages
-        socket.join(roomCode);
-
-        console.log(`CREATED: Room ${roomCode} created by ${username}. Expires in ${minutes} minutes. (for developer)`);
-
-        callback({
-            success: true,
-            roomCode: roomCode,
-            user: hostUser,
-            expiresAt: rooms[roomCode].expiresAt
-        });
+module.exports = function registerRoomHandler(io, socket, redis) {
+    socket.on('create-room', async ({ username, durationMins }, callback) => {
+        try {
+            if (await redis.exists(store.keys.socketRoom(socket.id))) return callback({ success: false, error: 'You are already inside a room!' });
+            if (!username || !username.trim()) return callback({ success: false, error: 'Username is required' });
+            const minutes = Number(durationMins);
+            if (!Number.isInteger(minutes) || minutes < 1 || minutes > MAX_ROOM_DURATION) {
+                return callback({ success: false, error: `Room duration must be between 1 and ${MAX_ROOM_DURATION} minutes.` });
+            }
+            const roomCode = await generateRoomCode(redis);
+            const hostUser = { userId: Math.random().toString(36).substring(2, 11), socketId: socket.id, username: username.trim(), joinedAt: Date.now() };
+            const room = createRoomObject(roomCode, hostUser, minutes);
+            const ttlMs = remainingMs(room);
+            await store.createRoom(redis, room, ttlMs);
+            await redis.pSetEx(store.keys.socketRoom(socket.id), ttlMs, roomCode);
+            socket.join(roomCode);
+            callback({ success: true, roomCode, user: hostUser, expiresAt: room.expiresAt });
+        } catch (error) { console.error('create-room failed', error); callback({ success: false, error: 'Unable to create room.' }); }
     });
 
+    socket.on('join-room', async ({ username, roomCode }, callback) => {
+        try {
+            if (await redis.exists(store.keys.socketRoom(socket.id))) return callback({ success: false, error: 'You are already inside a room' });
+            if (!username || !username.trim()) return callback({ success: false, error: 'Username is required!' });
+            if (!roomCode || !roomCode.trim()) return callback({ success: false, error: 'Roomcode is required!' });
+            const code = roomCode.trim().toUpperCase();
+            const room = await store.getRoom(redis, code);
+            if (!room || remainingMs(room) <= 0) return callback({ success: false, error: 'Room Not Found or expired!' });
+            const finalUsername = username.trim();
+            if (await store.getUser(redis, code, finalUsername)) return callback({ success: false, error: 'Username already taken!' });
+            const user = { userId: Math.random().toString(36).substring(2, 11), socketId: socket.id, username: finalUsername, joinedAt: Date.now() };
+            const ttlMs = remainingMs(room);
+            const userCount = await store.addUserIfRoomHasCapacity(redis, code, user, ttlMs);
+            if (userCount > store.MAX_USERS) return callback({ success: false, error: `Room is full (maximum ${store.MAX_USERS} users).` });
+            await redis.pSetEx(store.keys.socketRoom(socket.id), ttlMs, code);
+            socket.join(code);
+            const updatedRoom = await store.getRoom(redis, code);
+            socket.to(code).emit('user-joined', user);
+            callback({ success: true, room: updatedRoom, user });
+        } catch (error) { console.error('join-room failed', error); callback({ success: false, error: 'Unable to join room.' }); }
+    });
 
-    // --------------------------------------------------- JOIN -------------------------------------------------------------
-    socket.on("join-room", ({username, roomCode}, callback) =>{
-        // 0. if socket alrdy in a room
-        if(socket_room[socket.id]){
-            return callback({success:false, error: "You are already inside a room"})
-        }
+    socket.on('send-message', async (data) => {
+        try {
+            const code = await redis.get(store.keys.socketRoom(socket.id));
+            if (!code) return;
+            const room = await store.getRoom(redis, code);
+            if (!room || remainingMs(room) <= 0) return;
+            const sender = room.users.find((user) => user.socketId === socket.id);
+            if (!sender || !data.text) return;
+            const message = { text: data.text, sender: sender.username, senderSocketId: socket.id, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) };
+            await store.addMessage(redis, code, message, remainingMs(room));
+            io.to(code).emit('receive-message', message);
+        } catch (error) { console.error('send-message failed', error); }
+    });
 
-        // 1. username and code validation
-        if(!username || username.trim() === ""){
-            return callback({success:false, error:"Username is required!"})
-        }
-        if(!roomCode || roomCode.trim() === ""){
-            return callback({success:false, error:"Roomcode is required!"})
-        }
+    socket.on('leave-room', async (callback) => {
+        try { await leaveRoom(io, socket, redis); callback?.({ success: true }); }
+        catch (error) { console.error('leave-room failed', error); callback?.({ success: false }); }
+    });
 
-        const code = roomCode.trim().toUpperCase()
-        const targetRoom = rooms[code]   // room obj
-
-        // 2. Validation - does the room exist?
-        if(!targetRoom){
-            return callback({success:false, error:"Room Not Found!"})
-        }
-
-        // 3. Validation : has the room expired?
-        // this is lazy deletion. but we also use the active cleanup method which makes sure that old rooms are deleted from the memory by doing a search and cleanup after fixed intervals of time
-        if(Date.now() > targetRoom.expiresAt){
-            delete rooms[code]
-            return callback({success:false, error:"This room has already expired and vanished!"})
-        }
-
-        // UNIQUE USERNAMES
-        const final_username = username.trim()
-        const username_alrdy_exists = targetRoom.users.find(user => user.username === final_username)
-        if(username_alrdy_exists){
-            return callback({success:false, error:"username already taken!"})
-        }
-
-        // 4. create user object - if username is new and unique
-        const newuser = {
-            userId: Math.random().toString(36).substring(2,11), // 9-letter alphanumeric
-            socketId: socket.id,
-            username: final_username,
-            joinedAt: Date.now()
-        }
-
-        // memory objs
-        targetRoom.users.push(newuser)
-        socket_room[socket.id] = code
-
-        // socket.io joins the virtual room 
-        socket.join(code)
-        console.log(`JOINED: User ${username} joined room ${roomCode}`)
-
-        socket.to(code).emit("user-joined", newuser)
-        callback({
-            success:true,
-            room:targetRoom,
-            user:newuser
-        })
-    })
-
-    // ----------------------------------------------- SEND MESSAGE --------------------------------------------------------------------
-    socket.on("send-message", (data) =>{
-        const code = socket_room[socket.id]
-        if(!code || !rooms[code]) return
-        
-        const sender = rooms[code].users.find(u => u.socketId === socket.id)
-        const username = sender ? sender.username : "Anonymous"
-
-        const message = {
-            text: data.text, 
-            sender: username,
-            senderSocketId: socket.id,
-            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-            //id = `{socket.id}-${Date.now()}`
-        }
-
-        rooms[code].messages.push(message)
-        io.to(code).emit("receive-message", message)
-    })
-
-    // ------------------------------------ LEAVE (thru leave button) ----------------------------------
-    socket.on("leave-room", (callback)=>{
-        const code = socket_room[socket.id]
-        if(code && rooms[code]){
-            const targetroom = rooms[code]
-            const leavinguser = targetroom.users.find(u=> u.socketId === socket.id)
-
-            if (leavinguser) {
-                targetroom.users = targetroom.users.filter(u => u.socketId !== socket.id);
-                console.log(`${leavinguser.username} left room ${code}`);
-                // notify the room
-                socket.to(code).emit("user-left", { socketId: socket.id, username: leavinguser.username });
-            }
-
-            socket.leave(code)
-            if(targetroom.users.length === 0){
-                delete rooms[code]
-            }
-        }
-        delete socket_room[socket.id]
-        if(callback) callback({success:true})
-    })
-
-    socket.on("resume-session", ({roomCode, username}, callback) => {
-        if(!rooms[roomCode]){   // if room exists
-            return callback({success: false});
-        }
-
-        // Find the user in the room's user list
-        const userInRoom = rooms[roomCode].users.find(u => u.username === username);
-        if (userInRoom) {
-            userInRoom.isDisconnected = false;  // Reset their state so the timeout is ignored!
-            userInRoom.socketId = socket.id;     // Update to their brand-new Socket ID
-        }
-
-        socket.join(roomCode);  //put user's new socket id into socket.io room channel  
-        socket_room[socket.id] = roomCode;  // update socket_room
-
-        const chatHistory = rooms[roomCode].messages || [];
-        callback({
-            success: true,
-            roomCode: roomCode,
-            history: chatHistory,
-            users:  rooms[roomCode].users,
-            hostName: rooms[roomCode].host.username
-        })
-
-        socket.to(roomCode).emit("reconnected-message", {
-            sender: "System",
-            text: `${username} reconnected.`,
-            timestamp: new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})
-        })
-    })
-
+    socket.on('resume-session', async ({ roomCode, username }, callback) => {
+        try {
+            const code = roomCode?.trim().toUpperCase();
+            const room = code && await store.getRoom(redis, code);
+            const user = room && await store.getUser(redis, code, username);
+            if (!room || !user || remainingMs(room) <= 0) return callback({ success: false });
+            user.socketId = socket.id;
+            user.isDisconnected = false;
+            const ttlMs = remainingMs(room);
+            await store.putUser(redis, code, user, ttlMs);
+            await redis.pSetEx(store.keys.socketRoom(socket.id), ttlMs, code);
+            socket.join(code);
+            const updatedRoom = await store.getRoom(redis, code);
+            callback({ success: true, roomCode: code, history: updatedRoom.messages, users: updatedRoom.users, hostName: updatedRoom.host.username });
+            socket.to(code).emit('reconnected-message', { sender: 'System', text: `${username} reconnected.`, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) });
+        } catch (error) { console.error('resume-session failed', error); callback({ success: false }); }
+    });
 };
 
+async function leaveRoom(io, socket, redis) {
+    const code = await redis.get(store.keys.socketRoom(socket.id));
+    if (!code) return;
+    const room = await store.getRoom(redis, code);
+    if (room) {
+        const user = room.users.find((member) => member.socketId === socket.id);
+        if (user) {
+            await store.deleteUser(redis, code, user.username);
+            socket.to(code).emit('user-left', { socketId: socket.id, username: user.username });
+            if ((await store.getUsers(redis, code)).length === 0) await store.deleteRoom(redis, code);
+        }
+    }
+    await redis.del(store.keys.socketRoom(socket.id));
+    socket.leave(code);
+}
+
+module.exports.leaveRoom = leaveRoom;

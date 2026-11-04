@@ -21,6 +21,7 @@ Chatable is a real-time disappearing chat app where users can create temporary c
 - Node.js
 - Express
 - Socket.IO
+- Redis
 
 ## Project Structure
 
@@ -53,6 +54,9 @@ Start the server:
 npm start
 ```
 
+Start Redis first. By default the app connects to `redis://127.0.0.1:6379`; set
+`REDIS_URL` to use a hosted Redis instance instead.
+
 For development with auto-restart:
 
 ```bash
@@ -76,6 +80,11 @@ http://localhost:5000
 
 ## Notes
 
-- Room data is stored in server memory, so it resets when the server restarts.
+- Room data is stored in Redis. Room metadata and users use Redis hashes,
+  message history uses a Redis list, and socket-to-room lookups use Redis
+  string keys. All room keys receive the room's TTL and expire automatically.
+- Room creation accepts lifetimes from 1 to 1440 minutes (24 hours), validated
+  by the server. Each room holds at most 100 users, including its host, and
+  Redis retains only the latest 3000 messages per room.
 - This project is intended as a real-time chat app demo using Socket.IO.
 

@@ -3,6 +3,7 @@ const app = express();
 const http = require('http');
 const server = http.createServer(app);
 const { Server } = require('socket.io');
+const { createClient } = require('redis');
 const io = new Server(server, {
     cors : {
         origin : "*",
@@ -13,11 +14,10 @@ const io = new Server(server, {
 const path = require('path')
 
 // IMPORT THE HANDLER from roomHandler.js
-const registerRoomHandler = require('./src/roomHandler')
-const {startRoomCleanup} = require("./src/functions")
-
-const rooms={};
-const socket_room = {};
+const registerRoomHandler = require('./src/roomHandler');
+const store = require('./src/redisStore');
+const redis = createClient({ url: process.env.REDIS_URL || 'redis://127.0.0.1:6379' });
+redis.on('error', (error) => console.error('Redis error:', error.message));
 
 app.use(express.static(path.join(__dirname, "..", "client"))) // serves frontend files
 
@@ -29,55 +29,41 @@ io.on("connection", (socket) => {
     console.log(`A user connected with Socket id = ${socket.id} (for developer)`)
 
     // link handler to the incoming socket
-    registerRoomHandler(io, socket, rooms, socket_room)
+    registerRoomHandler(io, socket, redis)
 
     // DISCONNECTION LOGIC
-    // when someone accidentally disconnects(like refresh) 
+    // when someone accidentally disconnects (like a refresh)
     // - delayed leaving - in order to allow reconnection
-    socket.on("disconnect", () =>{
-        const code = socket_room[socket.id]
-
-        if(code && rooms[code]){    // if room exists
-            const targetroom = rooms[code]
-            const leavinguser = targetroom.users.find(u=> u.socketId === socket.id)
-
-            if(leavinguser){
-                leavinguser.isDisconnected = true;  // temporarily mark as disconnected
-                
-                // Give a 10 second grace period to reconnect before wiping their data
-                setTimeout(()=>{
-                    const usercheck = targetroom.users.find(u => u.username === leavinguser.username);
-                    if(usercheck && usercheck.isDisconnected){  // fetch user again to check if they re there and marked as disconnected
-                        // 1. Tell everyone they're gone
-                        io.to(code).emit("user-left", {
-                            socketId: socket.id,
-                            username: leavinguser.username
-                        })
-                        
-                        //2. Remove them from rooms[code]
-                        targetroom.users = targetroom.users.filter(u=> u.username !== leavinguser.username);
-                        console.log(`LEFT: ${leavinguser.username}`);
-
-                        // 3. Clean up room if there are no users left
-                        const activeUsers = targetroom.users.filter(u => !u.isDisconnected);
-                        if(activeUsers.length === 0){
-                            delete rooms[code];
-                            console.log(`Cleaned up - empty room destroyed`);
-                        }
-                    }
-                }, 10000);
-
-            }
-            delete socket_room[socket.id]
-        }
+    socket.on("disconnect", async () =>{
+        try {
+            const code = await redis.get(store.keys.socketRoom(socket.id));
+            const room = code && await store.getRoom(redis, code);
+            const user = room && room.users.find((member) => member.socketId === socket.id);
+            await redis.del(store.keys.socketRoom(socket.id));
+            if (!code || !room || !user) return;
+            user.isDisconnected = true;
+            await store.putUser(redis, code, user, Math.max(room.expiresAt - Date.now(), 1));
+            
+            setTimeout(async () => {
+                const current = await store.getUser(redis, code, user.username);
+                if (current?.isDisconnected) {
+                    await store.deleteUser(redis, code, user.username);
+                    io.to(code).emit('user-left', { socketId: socket.id, username: user.username });
+                    if ((await store.getUsers(redis, code)).length === 0) await store.deleteRoom(redis, code);
+                }
+            }, 10000);
+        } catch (error) { console.error('disconnect cleanup failed', error); }
     })
 })
 
-// Run background interval check
-startRoomCleanup(rooms, socket_room, io);
-
 const PORT = process.env.PORT || 5000;
 
-server.listen(PORT, ()=>{
-    console.log(`Server running on port ${PORT}`);
+async function start() {
+    await redis.connect();
+    server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+}
+
+start().catch((error) => {
+    console.error('Could not connect to Redis:', error.message);
+    process.exit(1);
 });
